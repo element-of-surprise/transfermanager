@@ -1,6 +1,7 @@
 package staticoverflow
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sync"
@@ -115,8 +116,12 @@ func TestGet(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		ctx, cancel := context.WithCancel(context.Background())
 		so := &TransferManager{
-			args: Args{DynamicLimit: test.limit},
+			ctx:       ctx,
+			cancel:    cancel,
+			statCalcs: &statCalcs{},
+			args:      Args{DynamicLimit: test.limit},
 			pool: sync.Pool{
 				New: func() interface{} {
 					return []byte{}
@@ -152,8 +157,7 @@ func TestGet(t *testing.T) {
 			<-done
 
 			stats := so.Stats()
-			// This is 1 because when we do the Put() above there is 1 outstanding buffer.
-			if stats.UsedStaticBuffer != 1 {
+			if stats.UsedStaticBuffer != 0 {
 				t.Errorf("TestGet(%s): UsedStaticBuffers: got %d, want %d", test.desc, stats.UsedStaticBuffer, 1)
 			}
 			if test.limit > 0 {
@@ -166,38 +170,54 @@ func TestGet(t *testing.T) {
 }
 
 func TestRun(t *testing.T) {
-	so, err := New(Args{BlockSize: _1MiB, StaticBlocks: 1, Concurrency: 8})
-	if err != nil {
-		panic(err)
-	}
-	defer so.Close()
-
-	mu := sync.Mutex{}
-	sl := make([]int, 0, 100)
-	wg := sync.WaitGroup{}
-
-	for i := 0; i < 100; i++ {
-		i := i
-		wg.Add(1)
-		so.Run(
-			func() {
-				defer wg.Done()
-				mu.Lock()
-				defer mu.Unlock()
-				sl = append(sl, i)
-			},
-		)
-	}
-	wg.Wait()
-
-	inOrder := true
-	last := 0
-	for _, i := range sl {
-		if i < last {
-			inOrder = false
-			break
+	var so *TransferManager
+	var sl = make([]int, 100)
+	do := func() {
+		sl = sl[0:0]
+		var err error
+		so, err = New(Args{BlockSize: _1MiB, StaticBlocks: 1, Concurrency: 8})
+		if err != nil {
+			panic(err)
 		}
-		last = i
+		defer so.Close()
+
+		mu := sync.Mutex{}
+		wg := sync.WaitGroup{}
+
+		for i := 0; i < 100; i++ {
+			i := i
+			wg.Add(1)
+			so.Run(
+				func() {
+					defer wg.Done()
+					mu.Lock()
+					defer mu.Unlock()
+					sl = append(sl, i)
+				},
+			)
+		}
+		wg.Wait()
+	}
+
+	// We test that Run() are actually parallel executions. We could have it randomly
+	// end up in order, so we retest up to 10 times to ensure.
+	var inOrder = true
+	for i := 0; i < 10; i++ {
+		do()
+		inOrder = true
+		last := 0
+		t.Log(sl)
+		for _, i := range sl {
+			if i < last {
+				inOrder = false
+				break
+			}
+			last = i
+		}
+		if inOrder {
+			continue
+		}
+		break
 	}
 	if inOrder {
 		t.Fatalf("TestRun: output order is not random as expected")
@@ -207,10 +227,10 @@ func TestRun(t *testing.T) {
 	if stats.NumRunning != 0 {
 		t.Errorf("TestRun: NumRunning: got %d, want 0", stats.NumRunning)
 	}
-	if so.latencyCount != 100 {
-		t.Errorf("TestRun: .latencyCount: got %d, want 100", so.latencyCount)
+	if so.statCalcs.latencyCount != 100 {
+		t.Errorf("TestRun: .latencyCount: got %d, want 100", so.statCalcs.latencyCount)
 	}
-	if so.latencyStore == 0 {
+	if so.statCalcs.latencyStore == 0 {
 		t.Errorf("TestRun: .latencyStore was never updated")
 	}
 }
@@ -224,14 +244,15 @@ func TestRecordLatency(t *testing.T) {
 
 	ti := now.Add(1 * time.Second)
 
-	so := &TransferManager{}
+	ctx, cancel := context.WithCancel(context.Background())
+	so := &TransferManager{ctx: ctx, cancel: cancel, statCalcs: &statCalcs{}}
 	so.recordLatency(ti)
 
-	if so.latencyCount != 1 {
-		t.Errorf("TestRecordLatency: .latencyCount: got %d, want 1", so.latencyCount)
+	if so.statCalcs.latencyCount != 1 {
+		t.Errorf("TestRecordLatency: .latencyCount: got %d, want 1", so.statCalcs.latencyCount)
 	}
-	if so.latencyStore != int64(1*time.Second) {
-		t.Errorf("TestRecordLatency: .latencyStore: got %d, want 1 second", time.Duration(so.latencyStore))
+	if so.statCalcs.latencyStore != int64(1*time.Second) {
+		t.Errorf("TestRecordLatency: .latencyStore: got %d, want 1 second", time.Duration(so.statCalcs.latencyStore))
 	}
 }
 
@@ -242,24 +263,27 @@ func TestLatencyCollect(t *testing.T) {
 	}
 	defer func() { nower = time.Now }()
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	so := TransferManager{
-		latencyStore: int64(10 * time.Duration(10*time.Millisecond)),
-		latencyCount: 10,
+		ctx:    ctx,
+		cancel: cancel,
+		statCalcs: &statCalcs{
+			latencyStore: int64(10 * time.Duration(10*time.Millisecond)),
+			latencyCount: 10,
+		},
 	}
-	so.latencyCollect()
-	got := so.latency.Load().(RunLatency)
-	want := RunLatency{
-		Avg:         10 * time.Millisecond,
-		Collections: 10,
-		Time:        now,
-	}
+	so.collect()
+	got := so.statCalcs.latency
+	want := 10 * time.Millisecond
+
 	if diff := pretty.Compare(want, got); diff != "" {
 		t.Errorf("TestLatencyCollect: -want/+got:\n%s", diff)
 	}
-	if so.latencyStore != 0 {
+	if so.statCalcs.latencyStore != 0 {
 		t.Errorf("TestLatencyCollect: .latencyStore was not reset")
 	}
-	if so.latencyCount != 0 {
+	if so.statCalcs.latencyCount != 0 {
 		t.Errorf("TestLatencyCollect: .latencyCount was not reset")
 	}
 }

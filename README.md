@@ -26,6 +26,14 @@ In addition, staticoverflow provides:
 if other settings would provide benefit
 * A Reset() method to adjust the settings in order to find optimal settings
 
+## Grapher TransferManager
+
+The grapher TransferManager is a wrapper around the Static Overflow TransferManager. It allows you gather graphs for different settings and then render them once your closed the TransferManager.
+
+This will let you see what your settings did over time and you can gauge if the settings are right for you.
+
+![Sample output](page.jpg)
+
 ## Future Plans
 
 I plan to eventually create a maxtransfer TransferManager that will use staticoverflow to try to automatically adjust for maximum transfer speed. This is great for use cases when you want to do bulk transfers and just want it to push as hard as it can.
